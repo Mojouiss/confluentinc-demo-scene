@@ -1,0 +1,38 @@
+# Example configuration for Financial Positions Snapshot Service
+
+# Kafka Configuration
+kafka:
+  bootstrap_servers: "localhost:9092"
+  topic: "financial-positions"
+  group_id: "financial-snapshot-consumer"
+  auto_offset_reset: "earliest"
+  enable_auto_commit: false
+  session_timeout_ms: 30000
+  max_poll_records: 5000
+
+# SQL Server Configuration
+sql_server:
+  server: "localhost"
+  database: "FinanceDB"
+  username: "sa"
+  password: "YourStrongPassword123"
+  driver: "ODBC Driver 17 for SQL Server"
+  port: 1433
+  connection_pool_size: 5
+  batch_size: 1000
+  connection_timeout: 30
+  table_name: "FinancialPositions"
+
+# Snapshot Configuration
+snapshot:
+  interval_seconds: 300  # 5 minutes
+  batch_size: 5000
+  commit_interval: 1000
+  max_retries: 3
+  retry_backoff_seconds: 5
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "json"
+  log_file: "/var/log/financial-snapshot/service.log"
