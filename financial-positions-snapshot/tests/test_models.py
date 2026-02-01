@@ -94,17 +94,18 @@ class TestFinancialPosition:
         )
         assert position.market_value == Decimal("15025.0")
         
-        # Slightly off but within tolerance - auto-corrected
+        # Slightly off but within tolerance - stays as is (under 1 cent tolerance)
         position = FinancialPosition(
             position_id="POS-123",
             account_id="ACC-456",
             symbol="AAPL",
             quantity=Decimal("100.0"),
             price=Decimal("150.25"),
-            market_value=Decimal("15025.005"),  # Slightly off
+            market_value=Decimal("15025.005"),  # Slightly off but within tolerance
             timestamp=datetime(2026, 2, 1, 12, 0, 0),
         )
-        assert position.market_value == Decimal("15025.0")
+        # Within 1 cent tolerance, so it's accepted as-is
+        assert position.market_value == Decimal("15025.005")
     
     def test_invalid_market_value(self):
         """Test invalid market value raises error."""

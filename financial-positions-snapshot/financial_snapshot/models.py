@@ -121,9 +121,10 @@ class FinancialPosition(BaseModel):
         tolerance = Decimal('0.01')  # 1 cent tolerance
         
         if abs(self.market_value - expected_value) > tolerance:
-            # Auto-correct if within reasonable bounds
+            # Auto-correct if within reasonable bounds (within 1% of expected)
             if abs(self.market_value - expected_value) < expected_value * Decimal('0.01'):
-                self.market_value = expected_value
+                # Auto-correct to expected value
+                object.__setattr__(self, 'market_value', expected_value)
             else:
                 raise ValueError(
                     f"Market value {self.market_value} does not match "
@@ -139,6 +140,13 @@ class FinancialPosition(BaseModel):
         Returns:
             tuple: Values in order matching SQL schema
         """
+        # Get position_type value (handle both enum and string)
+        position_type_value = (
+            self.position_type.value 
+            if isinstance(self.position_type, PositionType) 
+            else self.position_type
+        )
+        
         return (
             self.position_id,
             self.account_id,
@@ -148,7 +156,7 @@ class FinancialPosition(BaseModel):
             float(self.market_value),
             self.timestamp,
             self.currency,
-            self.position_type.value,
+            position_type_value,
         )
 
 

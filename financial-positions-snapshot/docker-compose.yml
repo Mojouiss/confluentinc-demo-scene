@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  financial-snapshot:
+    build: .
+    image: financial-snapshot:latest
+    container_name: financial-snapshot-service
+    environment:
+      # Kafka Configuration
+      KAFKA_BOOTSTRAP_SERVERS: "${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}"
+      KAFKA_TOPIC: "${KAFKA_TOPIC:-financial-positions}"
+      KAFKA_GROUP_ID: "${KAFKA_GROUP_ID:-financial-snapshot-consumer}"
+      
+      # SQL Server Configuration
+      SQL_SERVER: "${SQL_SERVER:-sqlserver}"
+      SQL_DATABASE: "${SQL_DATABASE:-FinanceDB}"
+      SQL_USERNAME: "${SQL_USERNAME:-sa}"
+      SQL_PASSWORD: "${SQL_PASSWORD}"
+      SQL_PORT: "${SQL_PORT:-1433}"
+      
+      # Snapshot Configuration
+      SNAPSHOT_INTERVAL_SECONDS: "${SNAPSHOT_INTERVAL_SECONDS:-300}"
+      SNAPSHOT_BATCH_SIZE: "${SNAPSHOT_BATCH_SIZE:-5000}"
+      
+      # Logging
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      LOG_FORMAT: "${LOG_FORMAT:-json}"
+    
+    volumes:
+      - ./logs:/var/log/financial-snapshot
+    
+    restart: unless-stopped
+    
+    depends_on:
+      - kafka
+      - sqlserver
+    
+    networks:
+      - financial-network
+
+  # Optional: Local Kafka for testing
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    depends_on:
+      - zookeeper
+    networks:
+      - financial-network
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - financial-network
+
+  # Optional: Local SQL Server for testing
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: sqlserver
+    environment:
+      ACCEPT_EULA: Y
+      SA_PASSWORD: "${SQL_PASSWORD:-YourStrong@Password123}"
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+    networks:
+      - financial-network
+
+networks:
+  financial-network:
+    driver: bridge
+
+volumes:
+  sqlserver-data:
