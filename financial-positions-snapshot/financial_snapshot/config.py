@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import yaml
 from pydantic import Field, field_validator
@@ -16,13 +16,18 @@ class KafkaConfig(BaseSettings):
         default="localhost:9092",
         description="Kafka bootstrap servers"
     )
-    topic: str = Field(
-        default="financial-positions",
-        description="Kafka topic to consume from"
+    topics: List[str] = Field(
+        default=["financial-positions"],
+        description="Kafka topics to consume from"
     )
     group_id: str = Field(
         default="financial-snapshot-consumer",
         description="Consumer group ID"
+    )
+    num_consumers: int = Field(
+        default=1,
+        ge=1,
+        description="Number of consumers in the consumer group (typically 1 per partition)"
     )
     auto_offset_reset: str = Field(
         default="earliest",
@@ -30,7 +35,7 @@ class KafkaConfig(BaseSettings):
     )
     enable_auto_commit: bool = Field(
         default=False,
-        description="Whether to auto-commit offsets"
+        description="Whether to auto-commit offsets (should be False for transactional processing)"
     )
     session_timeout_ms: int = Field(
         default=30000,
@@ -39,6 +44,14 @@ class KafkaConfig(BaseSettings):
     max_poll_records: int = Field(
         default=5000,
         description="Maximum records per poll"
+    )
+    load_offsets_from_sql: bool = Field(
+        default=True,
+        description="Load offsets from SQL Server on startup (vs from config/earliest)"
+    )
+    offsets_table: str = Field(
+        default="KafkaOffsets",
+        description="SQL table name for storing Kafka offsets"
     )
     
     model_config = SettingsConfigDict(env_prefix='KAFKA_')
@@ -122,17 +135,12 @@ class SnapshotConfig(BaseSettings):
     interval_seconds: int = Field(
         default=300,  # 5 minutes
         ge=1,
-        description="Snapshot interval in seconds"
+        description="Snapshot interval in seconds (time between writing buffered messages to SQL)"
     )
-    batch_size: int = Field(
-        default=5000,
+    buffer_size: int = Field(
+        default=100000,
         ge=1,
-        description="Number of messages to process per batch"
-    )
-    commit_interval: int = Field(
-        default=1000,
-        ge=1,
-        description="Commit offsets every N messages"
+        description="Maximum number of messages to buffer before forcing a snapshot"
     )
     max_retries: int = Field(
         default=3,
@@ -146,6 +154,36 @@ class SnapshotConfig(BaseSettings):
     )
     
     model_config = SettingsConfigDict(env_prefix='SNAPSHOT_')
+
+
+class HandlerConfig(BaseSettings):
+    """Message handler configuration."""
+    
+    default_handler_type: str = Field(
+        default="base",
+        description="Default message handler type (base, avro, financial_position)"
+    )
+    schema_registry_url: Optional[str] = Field(
+        default=None,
+        description="Confluent Schema Registry URL for Avro handlers"
+    )
+    # Mapping of message key package name to handler type
+    key_to_handler: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Mapping of message key package names to handler types"
+    )
+    # Mapping of message key package name to SQL table name
+    key_to_table: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Mapping of message key package names to SQL table names (database.schema.table)"
+    )
+    # Mapping of topic to default SQL table name
+    topic_to_table: Dict[str, str] = Field(
+        default_factory=lambda: {"financial-positions": "FinanceDB.dbo.FinancialPositions"},
+        description="Mapping of Kafka topics to default SQL table names"
+    )
+    
+    model_config = SettingsConfigDict(env_prefix='HANDLER_')
 
 
 class LoggingConfig(BaseSettings):
@@ -184,6 +222,7 @@ class Config(BaseSettings):
     sql_server: SQLServerConfig = Field(default_factory=SQLServerConfig)
     snapshot: SnapshotConfig = Field(default_factory=SnapshotConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    handler: HandlerConfig = Field(default_factory=HandlerConfig)
     
     model_config = SettingsConfigDict(
         env_file='.env',
@@ -219,7 +258,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
             kafka=KafkaConfig(**config_data.get('kafka', {})),
             sql_server=SQLServerConfig(**config_data.get('sql_server', {})),
             snapshot=SnapshotConfig(**config_data.get('snapshot', {})),
-            logging=LoggingConfig(**config_data.get('logging', {}))
+            logging=LoggingConfig(**config_data.get('logging', {})),
+            handler=HandlerConfig(**config_data.get('handler', {}))
         )
     
     # Load from environment variables
