@@ -1,0 +1,79 @@
+# Example configuration for Financial Positions Snapshot Service
+
+# Kafka Configuration
+kafka:
+  bootstrap_servers: "localhost:9092"
+  
+  # Multiple topics support (list)
+  topics:
+    - "financial-positions"
+    - "trading-positions"
+  
+  group_id: "financial-snapshot-consumer"
+  
+  # Number of consumers (typically 1 per partition)
+  num_consumers: 3
+  
+  auto_offset_reset: "earliest"
+  enable_auto_commit: false  # Must be false for transactional processing
+  session_timeout_ms: 30000
+  max_poll_records: 5000
+  
+  # Load offsets from SQL Server on startup (vs from Kafka/config)
+  load_offsets_from_sql: true
+  
+  # SQL table for storing Kafka offsets
+  offsets_table: "KafkaOffsets"
+
+# SQL Server Configuration
+sql_server:
+  server: "localhost"
+  database: "FinanceDB"
+  username: "sa"
+  password: "YourStrongPassword123"
+  driver: "ODBC Driver 17 for SQL Server"
+  port: 1433
+  connection_pool_size: 5
+  batch_size: 1000
+  connection_timeout: 30
+  table_name: "FinancialPositions"  # Default table (can be overridden per topic/key)
+
+# Snapshot Configuration
+snapshot:
+  # Interval between snapshot writes (in seconds)
+  interval_seconds: 300  # 5 minutes
+  
+  # Maximum messages to buffer before forcing a snapshot
+  buffer_size: 100000
+  
+  max_retries: 3
+  retry_backoff_seconds: 5
+
+# Message Handler Configuration
+handler:
+  # Default handler type for messages
+  default_handler_type: "financial_position"  # Options: base, avro, financial_position
+  
+  # Confluent Schema Registry URL (for Avro handlers)
+  schema_registry_url: "http://schema-registry:8081"
+  
+  # Map message key package names to handler types
+  key_to_handler:
+    "com.example.avro.Position": "avro"
+    "com.example.json.Trade": "base"
+  
+  # Map message key package names to SQL table names (database.schema.table)
+  key_to_table:
+    "com.example.avro.Position": "FinanceDB.dbo.AvroPositions"
+    "com.example.json.Trade": "TradingDB.dbo.Trades"
+  
+  # Map Kafka topics to default SQL table names
+  topic_to_table:
+    "financial-positions": "FinanceDB.dbo.FinancialPositions"
+    "trading-positions": "TradingDB.dbo.TradingPositions"
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "json"
+  log_file: "/var/log/financial-snapshot/service.log"
