@@ -1,24 +1,15 @@
-"""Main service orchestrator for financial position snapshots."""
+"""Main service orchestrator for financial position snapshots with transactional processing."""
 
 import logging
 from datetime import datetime
 from typing import Optional
-
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception_type,
-)
+from confluent_kafka import KafkaException
 
 from financial_snapshot.config import Config
-from financial_snapshot.kafka_consumer import (
-    FinancialPositionConsumer,
-    KafkaConsumerError,
-)
-from financial_snapshot.sql_writer import SQLServerWriter, SQLWriterError
+from financial_snapshot.multi_consumer import MultiConsumerManager
+from financial_snapshot.message_buffer import MessageBuffer
+from financial_snapshot.transactional_writer import TransactionalWriter
 from financial_snapshot.scheduler import SnapshotScheduler
-from financial_snapshot.models import SnapshotMetadata
 
 
 logger = logging.getLogger(__name__)
@@ -26,10 +17,13 @@ logger = logging.getLogger(__name__)
 
 class FinancialSnapshotService:
     """
-    Main service for financial position snapshots.
+    Main service for financial position snapshots with transactional processing.
     
-    Orchestrates the complete snapshot process including Kafka consumption,
-    validation, and SQL persistence.
+    Architecture:
+    1. Multiple consumers continuously consume from Kafka and buffer messages
+    2. Periodically (every N seconds), take a snapshot of buffered messages
+    3. Write data + offsets to SQL Server in a single transaction
+    4. Commit offsets to Kafka only after successful SQL transaction
     """
     
     def __init__(self, config: Config):
@@ -40,8 +34,9 @@ class FinancialSnapshotService:
             config: Service configuration
         """
         self.config = config
-        self.consumer: Optional[FinancialPositionConsumer] = None
-        self.writer: Optional[SQLServerWriter] = None
+        self.message_buffer: Optional[MessageBuffer] = None
+        self.consumer_manager: Optional[MultiConsumerManager] = None
+        self.writer: Optional[TransactionalWriter] = None
         self.scheduler: Optional[SnapshotScheduler] = None
         
         self._total_snapshots = 0
@@ -54,18 +49,44 @@ class FinancialSnapshotService:
         """Initialize all service components."""
         logger.info("Initializing service components")
         
-        # Initialize Kafka consumer
-        self.consumer = FinancialPositionConsumer(self.config.kafka)
-        self.consumer.connect()
+        # Initialize message buffer
+        self.message_buffer = MessageBuffer(
+            max_size=self.config.snapshot.buffer_size
+        )
         
-        # Initialize SQL writer
-        self.writer = SQLServerWriter(self.config.sql_server)
+        # Initialize transactional writer
+        self.writer = TransactionalWriter(
+            sql_config=self.config.sql_server,
+            consumer_group=self.config.kafka.group_id,
+            offsets_table=self.config.kafka.offsets_table
+        )
         
-        # Verify/create table
-        if not self.writer.verify_table_exists():
-            logger.warning("Target table does not exist, attempting to create")
-            if not self.writer.create_table_if_not_exists():
-                raise RuntimeError("Failed to create target table")
+        # Initialize tables
+        self.writer.initialize_tables()
+        
+        # Load initial offsets from SQL if configured
+        initial_offsets = None
+        if self.config.kafka.load_offsets_from_sql:
+            logger.info("Loading initial offsets from SQL Server")
+            initial_offsets = self.writer.load_initial_offsets()
+            
+            if initial_offsets:
+                logger.info(
+                    f"Loaded offsets for {len(initial_offsets)} topics",
+                    extra={"topics": list(initial_offsets.keys())}
+                )
+            else:
+                logger.info("No initial offsets found in SQL Server")
+        
+        # Initialize multi-consumer manager
+        self.consumer_manager = MultiConsumerManager(
+            kafka_config=self.config.kafka,
+            handler_config=self.config.handler,
+            message_buffer=self.message_buffer
+        )
+        
+        # Start consumers
+        self.consumer_manager.start(initial_offsets=initial_offsets)
         
         # Initialize scheduler
         self.scheduler = SnapshotScheduler(
@@ -75,24 +96,17 @@ class FinancialSnapshotService:
         
         logger.info("All components initialized successfully")
     
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((KafkaConsumerError, SQLWriterError)),
-    )
     def _execute_snapshot(self) -> None:
         """
         Execute a single snapshot cycle.
         
-        This method is called by the scheduler at regular intervals.
+        This method:
+        1. Drains messages from buffer
+        2. Writes data + offsets to SQL in single transaction
+        3. Commits offsets to Kafka on success
         """
         snapshot_id = f"snapshot_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
         start_time = datetime.utcnow()
-        
-        metadata = SnapshotMetadata(
-            snapshot_id=snapshot_id,
-            start_time=start_time,
-        )
         
         logger.info(
             f"Executing snapshot: {snapshot_id}",
@@ -100,37 +114,36 @@ class FinancialSnapshotService:
         )
         
         try:
-            # Consume batch from Kafka
-            positions = self.consumer.consume_batch(
-                batch_size=self.config.snapshot.batch_size,
-                timeout=1.0
-            )
+            # Drain messages from buffer
+            messages, next_offsets = self.message_buffer.drain_snapshot()
             
-            if not positions:
+            if not messages:
                 logger.info("No new positions to snapshot")
-                metadata.success = True
                 return
             
-            # Write to SQL Server
-            records_written = self.writer.write_batches(
-                positions,
-                batch_size=self.config.sql_server.batch_size
+            logger.info(
+                f"Drained {len(messages)} messages from buffer",
+                extra={
+                    "topics": len(next_offsets),
+                    "total_partitions": sum(len(p) for p in next_offsets.values())
+                }
             )
             
-            # Commit Kafka offsets
-            if records_written > 0:
-                self.consumer.commit_offsets(asynchronous=False)
+            # Write to SQL Server (data + offsets in single transaction)
+            records_written = self.writer.write_snapshot(
+                messages=messages,
+                next_offsets=next_offsets
+            )
             
-            # Update metadata
-            metadata.end_time = datetime.utcnow()
-            metadata.record_count = records_written
-            metadata.success = True
+            # Commit offsets to Kafka (only after successful SQL write)
+            if records_written > 0:
+                self._commit_to_kafka(next_offsets)
             
             # Update statistics
             self._total_snapshots += 1
             self._total_records_processed += records_written
             
-            duration = (metadata.end_time - start_time).total_seconds()
+            duration = (datetime.utcnow() - start_time).total_seconds()
             
             logger.info(
                 f"Snapshot {snapshot_id} completed successfully",
@@ -144,10 +157,6 @@ class FinancialSnapshotService:
             )
             
         except Exception as e:
-            metadata.end_time = datetime.utcnow()
-            metadata.success = False
-            metadata.error_message = str(e)
-            
             self._total_errors += 1
             
             logger.error(
@@ -159,8 +168,50 @@ class FinancialSnapshotService:
                 exc_info=True
             )
             
-            # Re-raise to trigger retry mechanism
-            raise
+            # Don't re-raise - let scheduler continue
+    
+    def _commit_to_kafka(self, next_offsets: dict) -> None:
+        """
+        Commit offsets to Kafka brokers.
+        
+        This is called only after successful SQL transaction.
+        
+        Args:
+            next_offsets: Dictionary mapping topic -> partition -> next offset
+        """
+        try:
+            # Get any consumer to commit (they all share the same consumer group)
+            if self.consumer_manager and self.consumer_manager.consumers:
+                consumer = self.consumer_manager.consumers[0]
+                
+                if consumer._consumer:
+                    from confluent_kafka import TopicPartition
+                    
+                    # Build list of TopicPartition objects
+                    partitions = []
+                    for topic, partition_offsets in next_offsets.items():
+                        for partition, offset in partition_offsets.items():
+                            tp = TopicPartition(topic, partition, offset)
+                            partitions.append(tp)
+                    
+                    # Commit offsets
+                    consumer._consumer.commit(offsets=partitions, asynchronous=False)
+                    
+                    logger.info(
+                        f"Committed offsets to Kafka",
+                        extra={
+                            "topics": len(next_offsets),
+                            "partitions": len(partitions)
+                        }
+                    )
+                    
+        except Exception as e:
+            logger.error(
+                "Failed to commit offsets to Kafka",
+                extra={"error": str(e)},
+                exc_info=True
+            )
+            # Non-fatal - offsets are saved in SQL, we can continue
     
     def start(self) -> None:
         """
@@ -197,13 +248,29 @@ class FinancialSnapshotService:
         if self.scheduler:
             self.scheduler.stop()
         
-        # Close consumer
-        if self.consumer:
+        # Stop consumers
+        if self.consumer_manager:
             try:
-                self.consumer.disconnect()
+                self.consumer_manager.stop()
             except Exception as e:
                 logger.error(
-                    "Error disconnecting consumer",
+                    "Error stopping consumers",
+                    extra={"error": str(e)}
+                )
+        
+        # Final snapshot of remaining buffered messages
+        if self.message_buffer and self.writer:
+            try:
+                logger.info("Processing final snapshot of remaining messages")
+                messages, next_offsets = self.message_buffer.drain_snapshot()
+                
+                if messages:
+                    self.writer.write_snapshot(messages, next_offsets)
+                    self._commit_to_kafka(next_offsets)
+                    logger.info(f"Final snapshot written: {len(messages)} messages")
+            except Exception as e:
+                logger.error(
+                    "Error in final snapshot",
                     extra={"error": str(e)}
                 )
         
@@ -238,13 +305,16 @@ class FinancialSnapshotService:
             }
         }
         
-        if self.consumer:
-            stats["consumer"] = self.consumer.get_statistics()
+        if self.consumer_manager:
+            stats["consumers"] = self.consumer_manager.get_statistics()
         
         if self.writer:
             stats["writer"] = self.writer.get_statistics()
         
         if self.scheduler:
             stats["scheduler"] = self.scheduler.get_statistics()
+        
+        if self.message_buffer:
+            stats["buffer"] = self.message_buffer.get_statistics()
         
         return stats
